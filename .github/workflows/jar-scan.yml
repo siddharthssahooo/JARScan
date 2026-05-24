@@ -1,0 +1,355 @@
+name: JARScan - Dependency and Security Analysis
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  REPORT_DIR: scan-reports
+
+jobs:
+  scan:
+    name: Scan JARs - JDK and Third-Party Libraries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Maven
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq maven
+
+      - name: Create report directory
+        run: mkdir -p "$REPORT_DIR"
+
+      # ---------------------------------------------------------------
+      # Step 1 - Extract metadata from all JARs
+      # ---------------------------------------------------------------
+      - name: Extract JAR metadata and JDK compatibility
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME_8_X64 }}
+        run: |
+          REPORT="$REPORT_DIR/01-metadata.txt"
+          echo "===== JAR METADATA AND JDK COMPATIBILITY REPORT =====" > "$REPORT"
+          echo "Generated: $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          for jar in $(find . -name '*.jar' -not -path './.git/*' | sort); do
+            echo "------------------------------------------------------" >> "$REPORT"
+            echo "JAR: $jar" >> "$REPORT"
+            echo "Size: $(du -h "$jar" | cut -f1)" >> "$REPORT"
+            echo "" >> "$REPORT"
+
+            # Maven coordinates from embedded pom.properties
+            echo "[Maven Coordinates]" >> "$REPORT"
+            props=$(unzip -p "$jar" 'META-INF/maven/*/pom.properties' 2>/dev/null || true)
+            if [ -n "$props" ]; then
+              echo "$props" >> "$REPORT"
+            else
+              echo "  (none found)" >> "$REPORT"
+            fi
+            echo "" >> "$REPORT"
+
+            # JDK compile target from MANIFEST.MF
+            echo "[JDK Compile Target]" >> "$REPORT"
+            manifest=$(unzip -p "$jar" META-INF/MANIFEST.MF 2>/dev/null || true)
+            echo "$manifest" | grep -iE 'Build-Jdk|X-Compile|Created-By|Require-Capability' >> "$REPORT" 2>/dev/null || echo "  (not specified)" >> "$REPORT"
+            echo "" >> "$REPORT"
+
+            # Multi-Release and module-info
+            is_mr=$(echo "$manifest" | grep -i 'Multi-Release' | head -1 || echo "  Multi-Release: false")
+            modules=$(unzip -l "$jar" 2>/dev/null | grep -c 'module-info.class' || echo "0")
+            echo "[Module Info]" >> "$REPORT"
+            echo "  $is_mr" >> "$REPORT"
+            echo "  module-info entries: $modules" >> "$REPORT"
+            echo "" >> "$REPORT"
+
+            # Bytecode version from sample class files
+            echo "[Bytecode Version (sample classes)]" >> "$REPORT"
+            TMP_DIR=$(mktemp -d)
+            (cd "$TMP_DIR" && unzip -q -o "$GITHUB_WORKSPACE/$jar" '*.class' 2>/dev/null || true)
+            find "$TMP_DIR" -name '*.class' -not -name 'module-info.class' | head -3 | while read cls; do
+              python3 -c "
+          import struct
+          with open('$cls','rb') as f:
+              f.read(4)
+              minor=struct.unpack('>H',f.read(2))[0]
+              major=struct.unpack('>H',f.read(2))[0]
+          jdk={45:'1.1',46:'1.2',47:'1.3',48:'1.4',49:'5',50:'6',51:'7',52:'8',53:'9',54:'10',55:'11',56:'12',57:'13',58:'14',59:'15',60:'16',61:'17',62:'18',63:'19',64:'20',65:'21'}
+          name='$(basename $cls)'
+          print(f'  {name}: bytecode {major} -> JDK {jdk.get(major,\"unknown\")}')
+          " 2>/dev/null >> "$REPORT" || true
+            done
+            rm -rf "$TMP_DIR"
+            echo "" >> "$REPORT"
+
+            # jdeps analysis
+            echo "[jdeps - Package Dependencies]" >> "$REPORT"
+            $JAVA_HOME/bin/jdeps "$jar" 2>&1 | tail -30 >> "$REPORT" || echo "  (jdeps analysis failed)" >> "$REPORT"
+            echo "" >> "$REPORT"
+          done
+
+          echo "" >> "$REPORT"
+          echo "===== END OF METADATA REPORT =====" >> "$REPORT"
+          cat "$REPORT"
+
+      # ---------------------------------------------------------------
+      # Step 2 - Resolve transitive dependency tree
+      # ---------------------------------------------------------------
+      - name: Resolve transitive dependencies
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
+        run: |
+          REPORT="$REPORT_DIR/02-dependency-tree.txt"
+          echo "===== TRANSITIVE DEPENDENCY TREE =====" > "$REPORT"
+          echo "Generated: $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          DEPS_XML=""
+          for jar in $(find . -name '*.jar' -not -path './.git/*' | sort); do
+            props=$(unzip -p "$jar" 'META-INF/maven/*/pom.properties' 2>/dev/null || true)
+            if [ -n "$props" ]; then
+              gid=$(echo "$props" | grep '^groupId=' | cut -d= -f2 | tr -d '[:space:]')
+              aid=$(echo "$props" | grep '^artifactId=' | cut -d= -f2 | tr -d '[:space:]')
+              ver=$(echo "$props" | grep '^version=' | cut -d= -f2 | tr -d '[:space:]')
+              if [ -n "$gid" ] && [ -n "$aid" ] && [ -n "$ver" ]; then
+                echo "Found: ${gid}:${aid}:${ver}" | tee -a "$REPORT"
+                DEPS_XML="$DEPS_XML<dependency><groupId>${gid}</groupId><artifactId>${aid}</artifactId><version>${ver}</version></dependency>"
+              fi
+            fi
+          done
+
+          if [ -z "$DEPS_XML" ]; then
+            echo "No Maven coordinates found in any JAR." >> "$REPORT"
+            cat "$REPORT"
+            exit 0
+          fi
+
+          cat > /tmp/pom.xml << EOF
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>com.jarscan</groupId>
+            <artifactId>resolver</artifactId>
+            <version>1.0.0</version>
+            <dependencies>${DEPS_XML}</dependencies>
+            <build><plugins><plugin>
+              <groupId>org.codehaus.mojo</groupId>
+              <artifactId>versions-maven-plugin</artifactId>
+              <version>2.17.1</version>
+            </plugin></plugins></build>
+          </project>
+          EOF
+
+          echo "" >> "$REPORT"
+          echo "[Dependency Tree]" >> "$REPORT"
+          mvn -f /tmp/pom.xml dependency:tree 2>&1 | grep -E '^\[INFO\] [|+\\]|^\[INFO\] com\.' >> "$REPORT" || echo "(resolution failed)" >> "$REPORT"
+
+          echo "" >> "$REPORT"
+          echo "[Flattened Dependency List]" >> "$REPORT"
+          mvn -f /tmp/pom.xml dependency:list 2>&1 | grep '^\[INFO\]    ' | sort -u >> "$REPORT" || true
+
+          echo "" >> "$REPORT"
+          echo "===== END OF DEPENDENCY TREE =====" >> "$REPORT"
+          cat "$REPORT"
+
+      # ---------------------------------------------------------------
+      # Step 3 - Check for outdated libraries and recommend upgrades
+      # ---------------------------------------------------------------
+      - name: Check for outdated libraries
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
+        run: |
+          REPORT="$REPORT_DIR/03-upgrade-recommendations.txt"
+          echo "===== UPGRADE RECOMMENDATIONS =====" > "$REPORT"
+          echo "Generated: $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          # Use versions-maven-plugin if pom exists from previous step
+          if [ -f /tmp/pom.xml ]; then
+            echo "[Versions Maven Plugin - Available Updates]" >> "$REPORT"
+            mvn -f /tmp/pom.xml versions:display-dependency-updates 2>&1 \
+              | grep -E 'The following|using|available' \
+              | sed 's/\[INFO\] //' >> "$REPORT" || echo "(check failed)" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+
+          # Query Maven Central for each library
+          echo "[Maven Central - Latest Versions]" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for jar in $(find . -name '*.jar' -not -path './.git/*' | sort); do
+            props=$(unzip -p "$jar" 'META-INF/maven/*/pom.properties' 2>/dev/null || true)
+            [ -z "$props" ] && continue
+            gid=$(echo "$props" | grep '^groupId=' | cut -d= -f2 | tr -d '[:space:]')
+            aid=$(echo "$props" | grep '^artifactId=' | cut -d= -f2 | tr -d '[:space:]')
+            ver=$(echo "$props" | grep '^version=' | cut -d= -f2 | tr -d '[:space:]')
+            [ -z "$gid" ] || [ -z "$aid" ] && continue
+
+            latest=$(curl -sf "https://search.maven.org/solrsearch/select?q=g:${gid}+AND+a:${aid}&rows=1&wt=json" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['response']['docs'][0]['latestVersion'])" 2>/dev/null || echo "unknown")
+
+            echo "  Library: ${gid}:${aid}" >> "$REPORT"
+            echo "  Current: ${ver}" >> "$REPORT"
+            echo "  Latest:  ${latest}" >> "$REPORT"
+            if [ "$ver" != "$latest" ] && [ "$latest" != "unknown" ]; then
+              echo "  Status:  UPDATE AVAILABLE (${ver} -> ${latest})" >> "$REPORT"
+            else
+              echo "  Status:  Up to date" >> "$REPORT"
+            fi
+            echo "" >> "$REPORT"
+          done
+
+          # Migration guidance
+          echo "[Migration Considerations]" >> "$REPORT"
+          echo "" >> "$REPORT"
+          for jar in $(find . -name '*.jar' -not -path './.git/*' | sort); do
+            props=$(unzip -p "$jar" 'META-INF/maven/*/pom.properties' 2>/dev/null || true)
+            gid=$(echo "$props" | grep '^groupId=' | cut -d= -f2 | tr -d '[:space:]')
+            aid=$(echo "$props" | grep '^artifactId=' | cut -d= -f2 | tr -d '[:space:]')
+
+            if echo "$gid" | grep -q 'jackson'; then
+              echo "  Jackson:" >> "$REPORT"
+              echo "    - 2.17.x to 2.18+: StreamReadConstraints defaults tightened since 2.16" >> "$REPORT"
+              echo "    - Jackson 3.x (future): package moves to tools.jackson, requires JDK 17+" >> "$REPORT"
+              echo "    - OpenRewrite: org.openrewrite.java.jackson recipes available" >> "$REPORT"
+              echo "" >> "$REPORT"
+            fi
+            if echo "$gid" | grep -q 'springframework'; then
+              echo "  Spring:" >> "$REPORT"
+              echo "    - Spring 5 to 6: requires JDK 17+, javax.* migrates to jakarta.*" >> "$REPORT"
+              echo "    - OpenRewrite: org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_0" >> "$REPORT"
+              echo "" >> "$REPORT"
+            fi
+            if echo "$aid" | grep -qi 'log4j'; then
+              echo "  Log4j:" >> "$REPORT"
+              echo "    - CRITICAL: Log4j 1.x is EOL with known RCE (CVE-2021-44228)" >> "$REPORT"
+              echo "    - Minimum safe version: Log4j 2.17.1+" >> "$REPORT"
+              echo "    - OpenRewrite: org.openrewrite.java.logging.log4j.Log4j1ToLog4j2" >> "$REPORT"
+              echo "" >> "$REPORT"
+            fi
+            if echo "$gid" | grep -q 'commons'; then
+              echo "  Apache Commons:" >> "$REPORT"
+              echo "    - commons-lang to commons-lang3: package rename" >> "$REPORT"
+              echo "    - commons-collections to commons-collections4: package rename" >> "$REPORT"
+              echo "" >> "$REPORT"
+            fi
+          done
+
+          # JDK migration path
+          echo "  JDK 8 to 17/21 Migration Path:" >> "$REPORT"
+          echo "    - javax.xml.bind (JAXB) removed in JDK 11: use jakarta.xml.bind-api" >> "$REPORT"
+          echo "    - sun.misc.Unsafe partially removed: use VarHandle" >> "$REPORT"
+          echo "    - Module system: add --add-opens/--add-exports for reflection" >> "$REPORT"
+          echo "    - OpenRewrite: org.openrewrite.java.migrate.UpgradeToJava17" >> "$REPORT"
+          echo "    - Test with: javac -Xlint:all -Werror to surface deprecations" >> "$REPORT"
+          echo "" >> "$REPORT"
+
+          echo "===== END OF UPGRADE RECOMMENDATIONS =====" >> "$REPORT"
+          cat "$REPORT"
+
+      # ---------------------------------------------------------------
+      # Step 4 - OWASP Dependency-Check for CVE scanning
+      # ---------------------------------------------------------------
+      - name: Run OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        id: depcheck
+        with:
+          project: JARScan
+          path: .
+          format: HTML
+          out: ${{ env.REPORT_DIR }}
+          args: >-
+            --scan "./**/*.jar"
+            --enableExperimental
+            --failOnCVSS 7
+        continue-on-error: true
+
+      - name: Run OWASP Dependency-Check SARIF
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: JARScan
+          path: .
+          format: SARIF
+          out: ${{ env.REPORT_DIR }}
+          args: >-
+            --scan "./**/*.jar"
+            --enableExperimental
+        continue-on-error: true
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/dependency-check-report.sarif
+        continue-on-error: true
+
+      # ---------------------------------------------------------------
+      # Step 5 - Publish summary and upload artifacts
+      # ---------------------------------------------------------------
+      - name: Generate workflow summary
+        if: always()
+        run: |
+          echo "## JARScan Analysis Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Scanned JARs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          for jar in $(find . -name '*.jar' -not -path './.git/*' | sort); do
+            props=$(unzip -p "$jar" 'META-INF/maven/*/pom.properties' 2>/dev/null || true)
+            gid=$(echo "$props" | grep '^groupId=' | cut -d= -f2 | tr -d '[:space:]')
+            aid=$(echo "$props" | grep '^artifactId=' | cut -d= -f2 | tr -d '[:space:]')
+            ver=$(echo "$props" | grep '^version=' | cut -d= -f2 | tr -d '[:space:]')
+            manifest=$(unzip -p "$jar" META-INF/MANIFEST.MF 2>/dev/null || true)
+            jdk=$(echo "$manifest" | grep -i 'X-Compile-Target-JDK\|Build-Jdk-Spec' | head -1 | cut -d: -f2 | tr -d '[:space:]')
+            echo "- **${aid:-$(basename $jar)}** v${ver:-?} (JDK target: ${jdk:-unknown}) - \`$jar\`" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Reports" >> $GITHUB_STEP_SUMMARY
+          echo "Download the **jarscan-reports** artifact below for full details:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`01-metadata.txt\` - JAR metadata, JDK compat, bytecode versions, jdeps" >> $GITHUB_STEP_SUMMARY
+          echo "- \`02-dependency-tree.txt\` - Transitive dependency tree" >> $GITHUB_STEP_SUMMARY
+          echo "- \`03-upgrade-recommendations.txt\` - Outdated libs and migration guidance" >> $GITHUB_STEP_SUMMARY
+          echo "- \`dependency-check-report.html\` - OWASP CVE scan results" >> $GITHUB_STEP_SUMMARY
+
+          # Inline the upgrade recommendations
+          if [ -f "$REPORT_DIR/03-upgrade-recommendations.txt" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Upgrade Recommendations" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat "$REPORT_DIR/03-upgrade-recommendations.txt" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload all reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarscan-reports
+          path: ${{ env.REPORT_DIR }}/
+          retention-days: 90
